@@ -1,6 +1,11 @@
-from .normalizer import normalize_article
-from database.mongodb import news_collection
+from .normalizer import normalize_article, validate_real_estate_article, SPAM_SOURCE_BLOCKLIST
+from database.mongodb import db, news_collection
 from difflib import SequenceMatcher
+from datetime import datetime
+import os
+
+REMOVED_COLLECTION = os.getenv('REMOVED_COLLECTION', 'news_articles_removed')
+removed_collection = db[REMOVED_COLLECTION]
 
 SIMILARITY_THRESHOLD = 0.9
 
@@ -32,6 +37,20 @@ def remove_duplicates(articles):
     seen_titles = []
     for raw in articles:
         norm = normalize_article(raw)
+        # validate using strict validator
+        res = validate_real_estate_article({'title': norm.get('title',''), 'description': norm.get('description',''), 'content': norm.get('content',''), 'source': norm.get('source','')})
+        if not res.get('accepted'):
+            # move to removed collection with reason
+            try:
+                doc = dict(norm)
+                doc['rejection_reason'] = res.get('reason')
+                doc['rejection_pos'] = res.get('pos_matches')
+                doc['rejection_neg'] = res.get('neg_matches')
+                doc['removed_at'] = datetime.utcnow().isoformat() + 'Z'
+                removed_collection.insert_one(doc)
+            except Exception:
+                pass
+            continue
         if not norm.get('url') and not norm.get('title'):
             continue
         if norm.get('url') in seen_urls:
@@ -47,12 +66,37 @@ def remove_duplicates(articles):
 def save_articles_bulk(articles):
     if not articles:
         return 0
+    inserted = 0
     try:
         for a in articles:
+            # assume already normalized
+            cat = a.get('category')
+            if cat != 'real_estate':
+                # move to removed collection with default reason
+                try:
+                    doc = dict(a)
+                    doc['rejection_reason'] = 'category_not_real_estate'
+                    doc['removed_at'] = datetime.utcnow().isoformat() + 'Z'
+                    removed_collection.insert_one(doc)
+                except Exception:
+                    pass
+                continue
+            source = (a.get('source') or '').strip()
+            if source and source.lower() in [s.strip().lower() for s in SPAM_SOURCE_BLOCKLIST if s.strip()]:
+                print(f"Skipping article from spam source: {source}")
+                try:
+                    doc = dict(a)
+                    doc['rejection_reason'] = 'spam_source'
+                    doc['removed_at'] = datetime.utcnow().isoformat() + 'Z'
+                    removed_collection.insert_one(doc)
+                except Exception:
+                    pass
+                continue
             try:
                 news_collection.insert_one(a)
+                inserted += 1
             except Exception:
                 continue
-        return len(articles)
+        return inserted
     except Exception:
         return 0
